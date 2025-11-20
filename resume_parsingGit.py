@@ -15,8 +15,11 @@ from sqlalchemy import desc, func
 # PDF/DOCX parsing
 import pdfplumber
 import docx
+from flask_sock import Sock
 
-os.environ["GEMINI_API_KEY"] = "AIzaSyBLjy8o"
+
+
+os.environ["GEMINI_API_KEY"] = "AIzaSyBLjy8"
 # Attempt LangChain / LangGraph imports (optional)
 USE_LANGCHAIN = False
 USE_LANGGRAPH = False
@@ -69,6 +72,8 @@ app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
 
+
+
 # ---------------- Models ----------------
 class Candidate(db.Model):
     __tablename__ = "candidates"
@@ -105,6 +110,16 @@ class EmailLog(db.Model):
     sent_ok = db.Column(db.Boolean, default=False)
     attempt_at = db.Column(db.DateTime, server_default=func.now())
     error = db.Column(db.Text)
+
+class InterviewSession(db.Model):
+    __tablename__ = "interviews"
+    id = db.Column(db.Integer, primary_key=True)
+    candidate_id = db.Column(db.Integer, db.ForeignKey("candidates.id"))
+    started_at = db.Column(db.DateTime, server_default=func.now())
+    ended_at = db.Column(db.DateTime)
+    transcript = db.Column(db.Text)  # full Q&A
+    score = db.Column(db.Float)      # AI-calculated
+
 
 with app.app_context():
     db.create_all()
@@ -217,7 +232,7 @@ def call_gemini_text(prompt_text: str, max_output_tokens: int = 512) -> str:
 def gemini_extract(resume_text: str, job_description: str ="") -> dict:
     prompt_text = EXTRACTION_PROMPT_TEXT.format(resume_text=resume_text, job_description=job_description)
     out = call_gemini_text(prompt_text, max_output_tokens=3000)
-    match = re.search(r'\$\$(.?)\$\$', out, re.DOTALL) 
+    match = re.search(r'\$\$(.*?)\$\$', out, re.DOTALL) 
     if match: 
         print("***match found**", out) 
         out = match.group(1)
@@ -290,14 +305,80 @@ def generate_email_llm(candidate_name: str, job_title: str, scheduling_link: str
     )
     import json
     try:
-        out = json.loads(response.text)
-        subject = out.get("subject", f"Interview Invitation — {job_title}")
-        body = out.get("body", f"Hi {candidate_name}, please schedule your interview here: {scheduling_link}")
+        out= response
+        match = re.search(r'\$\$(.*?)\$\$', out, re.DOTALL) 
+        if match: 
+            print("***match found**", out) 
+            out = match.group(1)
+        match = re.search(r'json\s*(.*)', out, re.DOTALL) 
+        if match: 
+            out = match.group(1) # Remove any trailing triple backticks if they exist 
+        out = re.sub(r'```', '', out).strip()
+        parsed = json.loads(out)
+        # out = json.loads(response.text)
+        subject = parsed.get("subject", f"Interview Invitation — {job_title}")
+        body = parsed.get("body", f"Hi {candidate_name}, please schedule your interview here: {scheduling_link}")
     except:
         subject = f"Interview Invitation — {job_title}"
         body = f"Hi {candidate_name}, please schedule your interview here: {scheduling_link}"
 
     return subject, body
+
+def generate_personalized_questions(resume_text: str, job_desc: str, num_questions: int = 5) -> List[str]:
+    """
+    Generate a list of interview questions for a candidate based on their resume and job description.
+    Uses Gemini LLM.
+    """
+    prompt = f"""
+    You are an HR interviewer. Generate {num_questions} concise interview questions for a candidate.
+    Use the candidate's resume and the job description below.
+    Resume: {resume_text[:2000]}
+    Job Description: {job_desc[:2000]}
+    Return in list format like:
+    return the output in between double dollar like $$...$$:
+    $$
+    ['question_1',..., 'question_n']
+    $$
+    """
+    response = call_gemini_text(prompt, max_output_tokens=2000)
+    try:
+        out= response
+        match = re.search(r'\$\$(.*?)\$\$', out, re.DOTALL) 
+        if match: 
+            print("***match found**", out) 
+            out = match.group(1)
+        import ast
+        questions = ast.literal_eval(out)
+        # questions = json.loads(response)
+        if isinstance(questions, list):
+            return questions
+    except:
+        pass
+    # fallback
+    return [f"Please tell me about your experience with {skill}" for skill in re.findall(r'\b\w+\b', job_desc)[:num_questions]]
+
+def score_interview(transcript: List[str], resume_text: str, job_desc: str) -> float:
+    """
+    Score candidate's interview based on transcript vs JD and resume.
+    Returns 0-100 score.
+    """
+    # answers_text = " ".join(transcript)
+    prompt = f"""
+        Evaluate the candidate's answers below and provide a score 0-100 for suitability for the role.
+        Resume: {resume_text[:5000]}
+        Job Description: {job_desc}
+        Candidate Question and Answers: {transcript}
+        Return only a numeric score.
+    """
+    response = call_gemini_text(prompt, max_output_tokens=50)
+    m = re.search(r"(\d+(\.\d+)?)", response)
+    if m:
+        return float(m.group(1))
+    return 0.0
+
+# ---------------- WebSocket Interview ----------------
+
+
 
 def send_invite_email_and_log(
     candidate_id: Optional[int],
@@ -555,10 +636,93 @@ def upload_resumes():
         "all": sorted_by,
         "invites_sent": invites_sent
     }), 200
+sock = Sock(app)
+@app.route("/start-interview/<int:candidate_id>", methods=["GET"])
+def start_interview(candidate_id):
+    cand = Candidate.query.get(candidate_id)
+    if not cand:
+        return jsonify({"error":"Candidate not found"}), 404
+    
+    # Create an interview session in DB
+    session = InterviewSession(candidate_id=candidate_id)
+    db.session.add(session)
+    db.session.commit()
+
+    # Generate a simple session token
+    token = f"session-{session.id}-{datetime.utcnow().timestamp()}"
+
+    return jsonify({
+        "session_id": session.id,
+        "candidate_name": cand.name,
+        "token": token,
+        "ws_url": "ws://your-server.com/api/interview"  # Websocket endpoint
+    })
+@sock.route('/api/interview')
+def realtime_interview(ws):
+    """
+    Real-time AI interview WebSocket:
+    1. Receives candidate ID and session token
+    2. Generates personalized questions
+    3. Sends each question as audio/text
+    4. Receives candidate answers
+    5. Computes interview score at the end
+    """
+    try:
+        # Receive initial payload with candidate_id
+        init_payload = json.loads(ws.receive())
+        candidate_id = init_payload.get("candidate_id")
+        session_token = init_payload.get("token")
+
+        cand = Candidate.query.get(candidate_id)
+        if not cand:
+            ws.send(json.dumps({"error": "Candidate not found"}))
+            return
+
+        session = InterviewSession(candidate_id=candidate_id)
+        db.session.add(session)
+        db.session.commit()
+
+        # Generate personalized questions
+        questions = generate_personalized_questions(cand.summary_text or "", init_payload.get("job_description",""))
+
+        transcript = []
+
+        ws.send(json.dumps({"msg": "Interview started.", "questions": questions}))
+        
+        #transcript_2 = [{"question": answer}, {"question": answer}]
+        transcript_2 ={}
+        # Iterate over questions
+        for q in questions:
+            ws.send(json.dumps({"question": q}))  # send question
+            answer_payload = json.loads(ws.receive())
+            answer_text = answer_payload.get("answer", "")
+            transcript.append(answer_text)
+            transcript_2[q]=answer_text
+
+        # Compute final interview score
+        interview_score = score_interview(transcript, cand.summary_text or "", init_payload.get("job_description",""))
+
+        # Save session details
+        session.transcript = "\n".join(transcript)
+        session.score = interview_score
+        session.ended_at = datetime.utcnow()
+        db.session.add(session)
+        db.session.commit()
+
+        ws.send(json.dumps({
+            "msg": "Interview completed.",
+            "transcript": transcript,
+            "interview_score": interview_score
+        }))
+
+    except Exception as e:
+        app.logger.exception("WebSocket interview error: %s", str(e))
+        ws.send(json.dumps({"error": str(e)}))
+
 
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     import logging
     logging.basicConfig(level=logging.INFO)
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run()
