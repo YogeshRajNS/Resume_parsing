@@ -7,6 +7,12 @@ from typing import List, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import json
+import re
+import ast
+import pyttsx3
+from typing import List
+
+engine = pyttsx3.init()
 
 from flask import Flask, request, jsonify, render_template
 from flask_sqlalchemy import SQLAlchemy
@@ -19,7 +25,7 @@ from flask_sock import Sock
 
 
 
-os.environ["GEMINI_API_KEY"] = "AIzaSyBLjy8"
+os.environ["GEMINI_API_KEY"] = "AIzaSyBLjy8o"
 # Attempt LangChain / LangGraph imports (optional)
 USE_LANGCHAIN = False
 USE_LANGGRAPH = False
@@ -287,7 +293,7 @@ from email.message import EmailMessage
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 SMTP_USER = "nsyogeshraj@gmail.com"
-SMTP_PASS = ""
+SMTP_PASS = "qxcd"
 FROM_EMAIL = SMTP_USER
 
 def generate_email_llm(candidate_name: str, job_title: str, scheduling_link: str = "#") -> tuple[str, str]:
@@ -324,10 +330,14 @@ def generate_email_llm(candidate_name: str, job_title: str, scheduling_link: str
 
     return subject, body
 
+def speak(text: str):
+    engine.say(text)
+    engine.runAndWait()
+
 def generate_personalized_questions(resume_text: str, job_desc: str, num_questions: int = 5) -> List[str]:
     """
     Generate a list of interview questions for a candidate based on their resume and job description.
-    Uses Gemini LLM.
+    Uses Gemini LLM and speaks each question using TTS.
     """
     prompt = f"""
     You are an HR interviewer. Generate {num_questions} concise interview questions for a candidate.
@@ -341,21 +351,33 @@ def generate_personalized_questions(resume_text: str, job_desc: str, num_questio
     $$
     """
     response = call_gemini_text(prompt, max_output_tokens=2000)
+
     try:
-        out= response
-        match = re.search(r'\$\$(.*?)\$\$', out, re.DOTALL) 
-        if match: 
-            print("***match found**", out) 
-            out = match.group(1)
-        import ast
+        match = re.search(r'\$\$(.*?)\$\$', response, re.DOTALL)
+        out = match.group(1) if match else response
         questions = ast.literal_eval(out)
-        # questions = json.loads(response)
-        if isinstance(questions, list):
-            return questions
+        return questions
+
     except:
-        pass
-    # fallback
-    return [f"Please tell me about your experience with {skill}" for skill in re.findall(r'\b\w+\b', job_desc)[:num_questions]]
+        # Fallback simple questions
+        fallback = [
+            f"Tell me about your experience with {skill}"
+            for skill in re.findall(r'\b\w+\b', job_desc)[:num_questions]
+        ]
+        return fallback
+# def generate_and_collect_answers(resume_text, job_desc, num_questions=5):
+#     questions = generate_personalized_questions(resume_text, job_desc, num_questions)
+
+#     answers = []
+
+#     for q in questions:
+#         print("QUESTION:", q)
+#         speak(q)
+
+#         ans = input("YOUR ANSWER: ")   # <-- you will type the answer here
+#         answers.append({"question": q, "answer": ans})
+
+#     return answers
 
 def score_interview(transcript: List[str], resume_text: str, job_desc: str) -> float:
     """
@@ -673,7 +695,7 @@ def realtime_interview(ws):
         candidate_id = init_payload.get("candidate_id")
         session_token = init_payload.get("token")
 
-        cand = Candidate.query.get(candidate_id)
+        cand = db.session.get(Candidate, candidate_id)
         if not cand:
             ws.send(json.dumps({"error": "Candidate not found"}))
             return
@@ -691,9 +713,10 @@ def realtime_interview(ws):
         
         #transcript_2 = [{"question": answer}, {"question": answer}]
         transcript_2 ={}
-        # Iterate over questions
+        # Iterate over questions%
         for q in questions:
             ws.send(json.dumps({"question": q}))  # send question
+            speak(q)
             answer_payload = json.loads(ws.receive())
             answer_text = answer_payload.get("answer", "")
             transcript.append(answer_text)
@@ -725,4 +748,4 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     import logging
     logging.basicConfig(level=logging.INFO)
-    app.run()
+    app.run(host="0.0.0.0", port=8000, debug=True)
