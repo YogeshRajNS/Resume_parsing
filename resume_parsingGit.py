@@ -9,11 +9,12 @@ from datetime import datetime
 import json
 import re
 import ast
-import pyttsx3
 from typing import List
+import threading
+from TTS.api import TTS
+import sounddevice as sd
 
-engine = pyttsx3.init()
-
+import simpleaudio as sa
 from flask import Flask, request, jsonify, render_template
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import desc, func
@@ -25,7 +26,8 @@ from flask_sock import Sock
 
 
 
-os.environ["GEMINI_API_KEY"] = "AIzaSyBLjy8o"
+
+os.environ["GEMINI_API_KEY"] = "AIzaSyC6"
 # Attempt LangChain / LangGraph imports (optional)
 USE_LANGCHAIN = False
 USE_LANGGRAPH = False
@@ -212,14 +214,19 @@ Return only the numeric score (e.g. 78)
 
 def call_gemini_text(prompt_text: str, max_output_tokens: int = 512) -> str:
     if MODEL is None:
+        print("[Debug] gemini model is none")
         app.logger.info("Gemini MODEL not configured — skipping LLM calls.")
         return ""
+    print("\n[DEBUG] Sending prompt to Gemini...")
+    print(prompt_text[:500], "...\n")
     try:
         resp = MODEL.generate_content(
             prompt_text,
             generation_config={"max_output_tokens": max_output_tokens}
         )
+        print("[Debug] Raw gemini response:", resp)
         if hasattr(resp, "text") and resp.text:
+            print("[Debug] gemini response Text:", resp.text)
             return resp.text.strip()
         if hasattr(resp, "candidates"):
             texts = []
@@ -232,12 +239,16 @@ def call_gemini_text(prompt_text: str, max_output_tokens: int = 512) -> str:
             return "\n".join(texts).strip()
         return str(resp)
     except Exception as e:
+        print("[DEBUG] ❌ Gemini API FAILED")
+        print("[DEBUG] Error:", e)
         app.logger.exception("Gemini call failed: %s", str(e))
         return ""
 
 def gemini_extract(resume_text: str, job_description: str ="") -> dict:
+    print("=======Gemini Extract Start=========")
     prompt_text = EXTRACTION_PROMPT_TEXT.format(resume_text=resume_text, job_description=job_description)
     out = call_gemini_text(prompt_text, max_output_tokens=3000)
+    print("watch this :",out)
     match = re.search(r'\$\$(.*?)\$\$', out, re.DOTALL) 
     if match: 
         print("***match found**", out) 
@@ -293,7 +304,7 @@ from email.message import EmailMessage
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 SMTP_USER = "nsyogeshraj@gmail.com"
-SMTP_PASS = "qxcd"
+SMTP_PASS = "qx"
 FROM_EMAIL = SMTP_USER
 
 def generate_email_llm(candidate_name: str, job_title: str, scheduling_link: str = "#") -> tuple[str, str]:
@@ -330,9 +341,51 @@ def generate_email_llm(candidate_name: str, job_title: str, scheduling_link: str
 
     return subject, body
 
-def speak(text: str):
-    engine.say(text)
-    engine.runAndWait()
+
+tts= TTS("tts_models/en/ljspeech/tacotron2-DDC")
+def speak(text:str):
+    audio=tts.tts(text)
+    sd.play(audio, samplerate=22050)
+    sd.wait()
+
+
+import speech_recognition as sr
+
+recognizer = sr.Recognizer()
+
+def listen_until_silence(timeout=3, phrase_time_limit=12):
+    """
+    Real-time STT that listens continuously until the user becomes silent
+    for 'timeout' seconds.
+    """
+
+    with sr.Microphone() as source:
+        print("\n🎤 Listening... (stop speaking to finish)\n")
+
+        recognizer.adjust_for_ambient_noise(source, duration=0.5)
+
+        audio_data = recognizer.listen(
+            source,
+            timeout=timeout,            # stop if user is silent
+            phrase_time_limit=phrase_time_limit  # max length of one phrase
+        )
+
+        try:
+            text = recognizer.recognize_google(audio_data)
+            print("📝 Recognized:", text)
+            return text
+
+        except sr.WaitTimeoutError:
+            print("⌛ No speech detected (timeout).")
+            return ""
+
+        except sr.UnknownValueError:
+            print("❓ Could not understand audio.")
+            return ""
+
+        except Exception as e:
+            print("❌ STT Error:", e)
+            return ""
 
 def generate_personalized_questions(resume_text: str, job_desc: str, num_questions: int = 5) -> List[str]:
     """
@@ -715,10 +768,12 @@ def realtime_interview(ws):
         transcript_2 ={}
         # Iterate over questions%
         for q in questions:
-            ws.send(json.dumps({"question": q}))  # send question
             speak(q)
+            ws.send(json.dumps({"question": q}))  # send question
+            speech_answer = listen_until_silence()
             answer_payload = json.loads(ws.receive())
-            answer_text = answer_payload.get("answer", "")
+            ui_answer = answer_payload.get("answer", "")
+            answer_text = speech_answer if speech_answer.strip() else ui_answer
             transcript.append(answer_text)
             transcript_2[q]=answer_text
 
