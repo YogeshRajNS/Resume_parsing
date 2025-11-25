@@ -13,6 +13,8 @@ from typing import List
 import threading
 from TTS.api import TTS
 import sounddevice as sd
+from docxtpl import DocxTemplate
+from docx2pdf import convert
 
 import simpleaudio as sa
 from flask import Flask, request, jsonify, render_template
@@ -27,7 +29,7 @@ from flask_sock import Sock
 
 
 
-os.environ["GEMINI_API_KEY"] = "AIzaSyC6"
+os.environ["GEMINI_API_KEY"] = "your gemini api key"
 # Attempt LangChain / LangGraph imports (optional)
 USE_LANGCHAIN = False
 USE_LANGGRAPH = False
@@ -304,7 +306,7 @@ from email.message import EmailMessage
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 SMTP_USER = "nsyogeshraj@gmail.com"
-SMTP_PASS = "qx"
+SMTP_PASS = "your google password"
 FROM_EMAIL = SMTP_USER
 
 def generate_email_llm(candidate_name: str, job_title: str, scheduling_link: str = "#") -> tuple[str, str]:
@@ -519,6 +521,94 @@ def send_invite_email_and_log(
 
 # ---------------- API / Processing ----------------
 
+def send_offer_letter_and_log(
+    candidate_id: int,
+    to_email: str,
+    candidate_name: str,
+    job_title: str,
+    offer_file_path: str,
+    max_retries: int = 2
+):
+    """
+    Sends an offer letter email with attachment (PDF/DOCX)
+    and logs it in EmailLog table.
+    """
+
+    # Build subject & body (can replace with LLM if needed)
+    subject = f"Congratulations {candidate_name}! Your Offer Letter for {job_title}"
+    body = (
+        f"Dear {candidate_name},\n\n"
+        "Congratulations! Based on your interview performance, we are pleased to "
+        "offer you the position.\n\n"
+        "Please find your official offer letter attached with this email.\n\n"
+        "Regards,\nHR Team"
+    )
+
+    # Log first attempt
+    log = EmailLog(
+        candidate_id=candidate_id,
+        to_email=to_email,
+        subject=subject,
+        body=body,
+        sent_ok=False,
+        error=None,
+        attempt_at=datetime.utcnow()
+    )
+    db.session.add(log)
+    db.session.commit()
+
+    ok = False
+    err = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            if not SMTP_HOST or not SMTP_USER or not SMTP_PASS:
+                raise RuntimeError("SMTP credentials not configured in environment")
+
+            msg = EmailMessage()
+            msg["Subject"] = subject
+            msg["From"] = FROM_EMAIL
+            msg["To"] = to_email
+            msg.set_content(body)
+
+            # Attach the offer letter
+            with open(offer_file_path, "rb") as f:
+                file_data = f.read()
+                filename = os.path.basename(offer_file_path)
+
+                # Detect file type automatically
+                if filename.endswith(".pdf"):
+                    msg.add_attachment(file_data, maintype="application", subtype="pdf", filename=filename)
+                elif filename.endswith(".docx"):
+                    msg.add_attachment(file_data, maintype="application",
+                                       subtype="vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                       filename=filename)
+                else:
+                    # fallback – treat as octet-stream
+                    msg.add_attachment(file_data, maintype="application",
+                                       subtype="octet-stream", filename=filename)
+
+            # SMTP Send
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+                server.starttls()
+                server.login(SMTP_USER, SMTP_PASS)
+                server.send_message(msg)
+
+            ok = True
+            break
+
+        except Exception as e:
+            err = str(e)
+
+    # Update email log
+    log.sent_ok = ok
+    log.error = err
+    log.attempt_at = datetime.utcnow()
+    db.session.add(log)
+    db.session.commit()
+
+    return ok, err
+
 @app.route("/")
 def ui():
     return render_template("index.html") if Path("templates/index.html").exists() else jsonify({"status":"resume-scanner","version":"upgraded"})
@@ -712,6 +802,19 @@ def upload_resumes():
         "invites_sent": invites_sent
     }), 200
 sock = Sock(app)
+
+@app.route("/api/upload_offer_template", methods=["POST"])
+def upload_offer_template():
+    employer_id = request.form.get("employer_id")
+    file = request.files.get("file")
+
+    if not file:
+        return jsonify({"error": "No file uploaded"}), 400
+    
+    save_path = f"templates/{employer_id}_offer_template.docx"
+    file.save(save_path)
+
+    return jsonify({"msg": "Template uploaded", "path": save_path})
 @app.route("/start-interview/<int:candidate_id>", methods=["GET"])
 def start_interview(candidate_id):
     cand = Candidate.query.get(candidate_id)
@@ -797,7 +900,77 @@ def realtime_interview(ws):
         app.logger.exception("WebSocket interview error: %s", str(e))
         ws.send(json.dumps({"error": str(e)}))
 
+@app.route("/api/generate_offer_letter", methods=["POST"])
+def generate_offer_letter():
+    """
+    1. Receives candidate_id
+    2. Checks interview score
+    3. Generates offer letter from uploaded template
+    4. Sends to candidate email
+    """
+    data = request.json
+    candidate_id = data.get("candidate_id")
 
+    cand = db.session.get(Candidate, candidate_id)
+    if not cand:
+        return jsonify({"error": "Candidate not found"}), 404
+
+    session = (
+        InterviewSession.query
+        .filter_by(candidate_id=candidate_id)
+        .order_by(InterviewSession.id.desc())
+        .first()
+    )
+
+    if not session:
+        return jsonify({"error": "Interview session not found"}), 404
+
+    # if session.score < 90:
+    #     return jsonify({"msg": "Score below 90, no offer letter sent."}), 200
+
+    # Template path
+    template_path = f"templates/{cand.employer_id}_offer_template.docx"
+    if not os.path.exists(template_path):
+        return jsonify({"error": "Employer offer letter template missing"}), 404
+
+    # Placeholder context
+    context = {
+        "CANDIDATE_NAME": cand.name,
+        "POSITION": cand.applied_role,
+        "JOINING_DATE": "15-Dec-2025",
+        "SALARY": cand.expected_salary or "15,000 per month",
+        "COMPANY_NAME": cand.company_name,
+    }
+
+    # Generate DOCX
+    output_docx = f"generated/offer_{candidate_id}.docx"
+    doc = DocxTemplate(template_path)
+    doc.render(context)
+    doc.save(output_docx)
+
+    # Convert DOCX → PDF
+    output_pdf = f"generated/offer_{candidate_id}.pdf"
+    convert(output_docx, output_pdf)
+
+    # Send email using new logging function
+    ok, err = send_offer_letter_and_log(
+        candidate_id=candidate_id,
+        to_email=cand.email,
+        candidate_name=cand.name,
+        job_title=cand.applied_role,
+        offer_file_path=output_pdf
+    )
+
+    if not ok:
+        return jsonify({
+            "msg": "Offer letter generated but email sending failed.",
+            "error": err
+        }), 500
+
+    return jsonify({
+        "msg": "Offer letter generated and sent successfully.",
+        "file_path": output_pdf
+    })
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
