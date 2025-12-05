@@ -15,7 +15,7 @@ from TTS.api import TTS
 import sounddevice as sd
 from docxtpl import DocxTemplate
 from docx2pdf import convert
-
+import pythoncom
 import simpleaudio as sa
 from flask import Flask, request, jsonify, render_template
 from flask_sqlalchemy import SQLAlchemy
@@ -29,7 +29,7 @@ from flask_sock import Sock
 
 
 
-os.environ["GEMINI_API_KEY"] = "your gemini api key"
+os.environ["GEMINI_API_KEY"] = "Your gemini api key"
 # Attempt LangChain / LangGraph imports (optional)
 USE_LANGCHAIN = False
 USE_LANGGRAPH = False
@@ -101,6 +101,9 @@ class Candidate(db.Model):
     resume_filename = db.Column(db.String(500))
     parsed_at = db.Column(db.DateTime, server_default=func.now())
     status = db.Column(db.String(50), default="processed")
+    job_role=db.Column(db.Text)
+    company_name=db.Column(db.Text)
+    salary=db.Column(db.Float)
 
 class MatchRecord(db.Model):
     __tablename__ = "matchrecords"
@@ -129,6 +132,48 @@ class InterviewSession(db.Model):
     ended_at = db.Column(db.DateTime)
     transcript = db.Column(db.Text)  # full Q&A
     score = db.Column(db.Float)      # AI-calculated
+
+class Offeraccepted(db.Model):
+    __tablename__ = "offeraccepted"
+    id=db.Column(db.Integer, primary_key=True)
+    candidate_id=db.Column(db.Integer, db.ForeignKey("candidates.id"))
+    job_role=db.Column(db.Text)
+    job_type=db.Column(db.Text)
+    candidate_name= db.Column(db.Text)
+
+
+class ConversationHistory(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    candidate_id = db.Column(db.String(20))
+    role = db.Column(db.String(10))  # 'user' / 'assistant'
+    content = db.Column(db.Text)
+
+class DocumentTemplate(db.Model):
+    __tablename__ = "document_templates"
+    id = db.Column(db.Integer, primary_key=True)
+    template_name = db.Column(db.String(200))
+    company_name = db.Column(db.String(200))
+    file_path = db.Column(db.String(300))
+    uploaded_at = db.Column(db.DateTime, server_default=func.now())
+
+
+class InternshipProcess(db.Model):
+    __tablename__ = "internship_process"
+    id = db.Column(db.Integer, primary_key=True)
+    candidate_id = db.Column(db.Integer, db.ForeignKey("candidates.id"))
+    internship_end = db.Column(db.DateTime)
+    review_status = db.Column(db.String(50), default="pending")  # pending / approved / rejected
+    approved_doc = db.Column(db.String(200), nullable=True)
+    last_updated = db.Column(db.DateTime, server_default=func.now(), onupdate=func.now())
+
+class InternshipProcess1(db.Model):
+    __tablename__="internship_process1"
+    id = db.Column(db.Integer, primary_key=True)
+    candidate_id = db.Column(db.Integer, nullable=False)
+    review_status = db.Column(db.String(50), default="pending")
+    # maybe your columns are named differently
+    internship_start = db.Column(db.Date)
+    internship_end= db.Column(db.Date)
 
 
 with app.app_context():
@@ -188,7 +233,10 @@ EXTRACTION_PROMPT_TEXT = """
     "TotalExperienceYears": number or null,
     "WorkExperience": string or null,
     "Achievements": [ "achievement1", ... ],
-    "Summary": string or null
+    "Summary": string or null,
+    "JobRole": string,
+    "CompanyName": string,
+    "Salary":integer
     }}
     $$
     
@@ -306,39 +354,40 @@ from email.message import EmailMessage
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 SMTP_USER = "nsyogeshraj@gmail.com"
-SMTP_PASS = "your google password"
+SMTP_PASS = "Your google app keyword"
 FROM_EMAIL = SMTP_USER
 
-def generate_email_llm(candidate_name: str, job_title: str, scheduling_link: str = "#") -> tuple[str, str]:
+def generate_email_llm(candidate_name: str, company_name: str, job_role: str, candidate_id: int,token=None,session_id=None) -> tuple[str, str]:
+    # Build real-time interview URL dynamically based on current host
+    HOST = "localhost:8000"
+    scheduling_link = f"http://{HOST}/"
 
     prompt = f"""
     You are an HR assistant. 
     Write a professional and friendly email subject and body inviting the candidate {candidate_name} 
-    for an interview for the position of {job_title}. 
-    Include the scheduling link: {scheduling_link}.
+    for an interview in the company {company_name} for the position of {job_role}. 
+    Include the scheduling link: {scheduling_link} Your session ID: {session_id}
+    Your token: {token}.
     Return only JSON with "subject" and "body".
     """
-    response = call_gemini_text(
-        prompt,
-        max_output_tokens=256
-    )
+    response = call_gemini_text(prompt, max_output_tokens=256)
+
     import json
     try:
-        out= response
-        match = re.search(r'\$\$(.*?)\$\$', out, re.DOTALL) 
-        if match: 
-            print("***match found**", out) 
+        out = response
+        match = re.search(r'\$\$(.*?)\$\$', out, re.DOTALL)
+        if match:
             out = match.group(1)
-        match = re.search(r'json\s*(.*)', out, re.DOTALL) 
-        if match: 
-            out = match.group(1) # Remove any trailing triple backticks if they exist 
+        match = re.search(r'json\s*(.*)', out, re.DOTALL)
+        if match:
+            out = match.group(1)
         out = re.sub(r'```', '', out).strip()
         parsed = json.loads(out)
-        # out = json.loads(response.text)
-        subject = parsed.get("subject", f"Interview Invitation — {job_title}")
+
+        subject = parsed.get("subject", f"Interview Invitation — {job_role}")
         body = parsed.get("body", f"Hi {candidate_name}, please schedule your interview here: {scheduling_link}")
-    except:
-        subject = f"Interview Invitation — {job_title}"
+    except Exception:
+        subject = f"Interview Invitation — {job_role}"
         body = f"Hi {candidate_name}, please schedule your interview here: {scheduling_link}"
 
     return subject, body
@@ -420,19 +469,7 @@ def generate_personalized_questions(resume_text: str, job_desc: str, num_questio
             for skill in re.findall(r'\b\w+\b', job_desc)[:num_questions]
         ]
         return fallback
-# def generate_and_collect_answers(resume_text, job_desc, num_questions=5):
-#     questions = generate_personalized_questions(resume_text, job_desc, num_questions)
 
-#     answers = []
-
-#     for q in questions:
-#         print("QUESTION:", q)
-#         speak(q)
-
-#         ans = input("YOUR ANSWER: ")   # <-- you will type the answer here
-#         answers.append({"question": q, "answer": ans})
-
-#     return answers
 
 def score_interview(transcript: List[str], resume_text: str, job_desc: str) -> float:
     """
@@ -461,15 +498,23 @@ def send_invite_email_and_log(
     candidate_id: Optional[int],
     to_email: str,
     candidate_name: str,
-    job_title: str,
+    job_role: str,
+    company_name:str,
     scheduling_link: str = "#",
-    max_retries: int = 2
+    max_retries: int = 2,
+    token: Optional[str] = None,
+    session_id: Optional[int] = None,
 ):
     """
     Sends an LLM-generated interview invite email and logs the attempt in the DB
     """
-    subject, body = generate_email_llm(candidate_name, job_title, scheduling_link)
+    subject, body = generate_email_llm(candidate_name, job_role,company_name, scheduling_link)
+    if scheduling_link:
+        body += f"\n\nSchedule Link: {scheduling_link}"
 
+# ✔ Session ID separate
+    if session_id:
+        body += f"\nSession ID: {session_id}"
     # Log initial attempt
     log = EmailLog(
         candidate_id=candidate_id,
@@ -525,9 +570,11 @@ def send_offer_letter_and_log(
     candidate_id: int,
     to_email: str,
     candidate_name: str,
-    job_title: str,
+    job_role: str,
     offer_file_path: str,
+    company_name: str,
     max_retries: int = 2
+   
 ):
     """
     Sends an offer letter email with attachment (PDF/DOCX)
@@ -535,14 +582,22 @@ def send_offer_letter_and_log(
     """
 
     # Build subject & body (can replace with LLM if needed)
-    subject = f"Congratulations {candidate_name}! Your Offer Letter for {job_title}"
+    subject = f"Congratulations {candidate_name}! Your Offer Letter for {job_role}"
     body = (
-        f"Dear {candidate_name},\n\n"
-        "Congratulations! Based on your interview performance, we are pleased to "
-        "offer you the position.\n\n"
-        "Please find your official offer letter attached with this email.\n\n"
-        "Regards,\nHR Team"
-    )
+    f"Dear {candidate_name},\n\n"
+    f"We are pleased to inform you that, based on your strong performance in the interview "
+    f"process, you have been selected for the position of {job_role} with {company_name}.\n\n"
+    f"Please find your official offer letter attached to this email. "
+    f"Kindly review the document carefully and confirm your acceptance by replying to this email "
+    f"or signing and returning the attached offer letter within the specified timeline.\n\n"
+    f"We are confident that your skills and experience will greatly contribute to our organization’s success, "
+    f"and we look forward to welcoming you onboard.\n\n"
+    f"In case of any queries or further clarification, please feel free to contact the HR department.\n\n"
+    f"Regards,\n"
+    f"Human Resources Department\n"
+    f"{company_name}"
+)
+
 
     # Log first attempt
     log = EmailLog(
@@ -682,18 +737,31 @@ def process_single_resume(path: str, filename: str, job_desc: str, required_skil
                 embedding = str(emb) if emb is not None else None,
                 score = final_score,
                 resume_filename = filename,
-                status=status
+                status=status,
+                job_role=parsed.get("JobRole"),
+                company_name=parsed.get("CompanyName"),
+                salary=parsed.get("Salary")
+
+
             )
             db.session.add(cand)
             db.session.commit()
 
             if cand.score >= 70 and cand.email:
+                start_interview_resp = start_interview(cand.id)
+                interview_data = start_interview_resp.get_json() if hasattr(start_interview_resp, "get_json") else start_interview_resp
+                session_id = interview_data.get('session_id')
+                token = interview_data.get('token')
+                scheduling_link = f"http://localhost:8000/start-interview/{cand.id}?token={interview_data.get('token')}"
                 send_invite_email_and_log(
                     candidate_id=cand.id,
                     to_email=cand.email,
                     candidate_name=cand.name,
-                    job_title="Applied Role",
-                    scheduling_link="https://calendly.com/your-link"
+                    job_role=cand.job_role,
+                    company_name=cand.company_name,
+                    token=interview_data.get('token'),
+                    session_id=interview_data.get('session_id'),  # NEW ✔
+                    scheduling_link=scheduling_link 
                 )
 
             mr = MatchRecord(candidate_id=cand.id,  skill_matches=",".join(matched_skills), score=final_score)
@@ -777,7 +845,7 @@ def upload_resumes():
         for c in sorted_by:
             if c.get("status") == "shortlisted" and c.get("email"):
                 try:
-                    ok, err = send_invite_email_and_log(c.get("id"), c["email"], c.get("name"), job_title="Applied Role")
+                    ok, err = send_invite_email_and_log(c.get("id"), c["email"], c.get("name"), job_role="Applied Role")
                     c["invite_sent"] = ok
                     invites_sent.append({"id": c.get("id"), "email": c.get("email"), "sent": ok, "err": err})
                 except Exception as e:
@@ -815,6 +883,144 @@ def upload_offer_template():
     file.save(save_path)
 
     return jsonify({"msg": "Template uploaded", "path": save_path})
+
+
+@app.route("/offer_accepted", methods=["POST"])
+def offer_accepted():
+
+    body = request.json
+
+    candidate_id = body.get("candidate_id")
+    candidate_name = body.get("candidate_name")
+    job_role = body.get("job_role")
+    job_type = body.get("job_type")
+    company_name = body.get("company_name")
+    job_description = body.get("job_description")
+    training_months = body.get("training_months")
+    company_type = body.get("company_type")
+    employee_count = body.get("employee_count")
+
+    # Save to DB
+    data = Offeraccepted(
+        candidate_id=candidate_id,
+        candidate_name=candidate_name,
+        job_role=job_role,
+        job_type=job_type
+   
+    )
+    db.session.add(data)
+    db.session.commit()
+
+    # Gemini Query Prompt
+    prompt = f"""
+    Suggest onboarding and job-specific training for a new hire:
+    
+    Candidate: {candidate_name}
+    Role: {job_role}
+    Company: {company_name}
+    Company Type: {company_type}
+    Employees: {employee_count}
+    Job Description: {job_description}
+    Training Duration (months): {training_months}
+
+    Include:
+    - Training Modules List
+    - Company Culture & Policies Brief
+    - Tools/Access Required
+    - Progress & Assessment plan
+    """
+
+    model = genai.GenerativeModel("gemini-2.0-flash")
+    response = model.generate_content(prompt)
+    
+    return jsonify({
+        "message": "Offer accepted and onboarding plan generated successfully",
+        "training_recommendation": response.text
+    })
+
+@app.route("/offer_accepted_candidates", methods=["GET"])
+def get_offer_accepted_candidates():
+    # Fetch all records from the Offeraccepted table
+    candidates = Offeraccepted.query.all()
+    
+    # Convert the records to a list of dictionaries
+    result = []
+    for c in candidates:
+        result.append({
+            "candidate_id": c.candidate_id,
+            "candidate_name": c.candidate_name,
+            "job_role": c.job_role,
+            "job_type": c.job_type
+        })
+    
+    return jsonify({
+        "message": "List of candidates who accepted offers",
+        "candidates": result
+    })
+
+
+@app.route("/chat", methods=["POST"])
+def employer_chat():
+    body = request.get_json()
+
+    candidate_id = body.get("candidate_id")
+    message = body.get("message")
+
+    if not candidate_id or not message:
+        return jsonify({"error": "candidate_id and message required"}), 400
+
+    # Save employer message as "user"
+    db.session.add(ConversationHistory(
+        candidate_id=candidate_id,
+        role="user",
+        content=message
+    ))
+    db.session.commit()
+
+    # Fetch history
+    history = ConversationHistory.query.filter_by(candidate_id=candidate_id).order_by(ConversationHistory.id.asc()).all()
+
+    chat_context = ""
+    for h in history:
+        chat_context += f"{h.role}: {h.content}\n"
+
+    prompt = f"""
+    You are HR Onboarding Assistant helping an employer communicate with a new hire.
+
+    Past Conversation:
+    {chat_context}
+
+    Latest Employer message: {message}
+
+    Provide a friendly HR assistant response including:
+    - onboarding guidance
+    - next steps for the employee
+    """
+
+    model = genai.GenerativeModel("gemini-2.0-flash")
+
+    response = model.generate_content(
+        contents=[{
+            "role": "user",
+            "parts": [{"text": prompt}]
+        }]
+    )
+
+    ai_reply_text = response.text
+
+    # Save AI reply as "assistant"
+    db.session.add(ConversationHistory(
+        candidate_id=candidate_id,
+        role="assistant",
+        content=ai_reply_text
+    ))
+    db.session.commit()
+
+    return jsonify({
+        "reply": ai_reply_text,
+        "candidate_id": candidate_id
+    })
+
 @app.route("/start-interview/<int:candidate_id>", methods=["GET"])
 def start_interview(candidate_id):
     cand = Candidate.query.get(candidate_id)
@@ -833,7 +1039,7 @@ def start_interview(candidate_id):
         "session_id": session.id,
         "candidate_name": cand.name,
         "token": token,
-        "ws_url": "ws://your-server.com/api/interview"  # Websocket endpoint
+        "ws_url": f"ws://localhost:8000/api/interview"  # Websocket endpoint
     })
 @sock.route('/api/interview')
 def realtime_interview(ws):
@@ -896,6 +1102,7 @@ def realtime_interview(ws):
             "interview_score": interview_score
         }))
 
+
     except Exception as e:
         app.logger.exception("WebSocket interview error: %s", str(e))
         ws.send(json.dumps({"error": str(e)}))
@@ -912,6 +1119,8 @@ def generate_offer_letter():
     candidate_id = data.get("candidate_id")
 
     cand = db.session.get(Candidate, candidate_id)
+    print("candidate_id", candidate_id)
+    print("cand", cand.name)
     if not cand:
         return jsonify({"error": "Candidate not found"}), 404
 
@@ -923,30 +1132,40 @@ def generate_offer_letter():
     )
 
     if not session:
+        print('4444')
         return jsonify({"error": "Interview session not found"}), 404
 
-    # if session.score < 90:
-    #     return jsonify({"msg": "Score below 90, no offer letter sent."}), 200
+    if session.score < 3:
+        print("5555")
+        return jsonify({"msg": "Score below 90, no offer letter sent."}), 200
+
 
     # Template path
-    template_path = f"templates/{cand.employer_id}_offer_template.docx"
+    template_path = os.path.join(app.root_path, "templates", f"1_offer_template.docx")
+    print("Looking for template at:", template_path)
     if not os.path.exists(template_path):
+        print('2222')
         return jsonify({"error": "Employer offer letter template missing"}), 404
-
+    print('3333')
     # Placeholder context
     context = {
         "CANDIDATE_NAME": cand.name,
-        "POSITION": cand.applied_role,
+        "POSITION": cand.job_role or "AI/ML",
         "JOINING_DATE": "15-Dec-2025",
-        "SALARY": cand.expected_salary or "15,000 per month",
-        "COMPANY_NAME": cand.company_name,
+        "SALARY": cand.salary or 15000,
+        "COMPANY_NAME": cand.company_name or "abc",
     }
 
+    output_dir = "generated"
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
     # Generate DOCX
     output_docx = f"generated/offer_{candidate_id}.docx"
     doc = DocxTemplate(template_path)
     doc.render(context)
     doc.save(output_docx)
+
+    pythoncom.CoInitialize()
 
     # Convert DOCX → PDF
     output_pdf = f"generated/offer_{candidate_id}.pdf"
@@ -957,8 +1176,9 @@ def generate_offer_letter():
         candidate_id=candidate_id,
         to_email=cand.email,
         candidate_name=cand.name,
-        job_title=cand.applied_role,
-        offer_file_path=output_pdf
+        job_role=cand.job_role or "AI/ML",
+        offer_file_path=output_pdf,
+        company_name=cand.company_name,
     )
 
     if not ok:
@@ -971,6 +1191,158 @@ def generate_offer_letter():
         "msg": "Offer letter generated and sent successfully.",
         "file_path": output_pdf
     })
+from flask import request, jsonify
+from datetime import datetime, timedelta
+
+@app.route("/create_internship_for_offer_accepted", methods=["POST"])
+def create_internship_for_offer_accepted():
+    """
+    This endpoint takes a candidate_id and creates a new internship record
+    with start and end dates for the candidate who accepted the offer.
+    """
+    data = request.get_json()
+    candidate_id = data.get("candidate_id")
+    internship_start_str = data.get("internship_start")  # format: "YYYY-MM-DD"
+    internship_end_str = data.get("internship_end")      # format: "YYYY-MM-DD"
+
+    if not candidate_id:
+        return jsonify({"error": "candidate_id is required"}), 400
+
+    # Fetch candidate details from Offeraccepted table
+    candidate = Offeraccepted.query.filter_by(candidate_id=candidate_id).first()
+    if not candidate:
+        return jsonify({"error": "Candidate not found in offer accepted table"}), 404
+
+    # Parse dates
+    try:
+        internship_start = datetime.strptime(internship_start_str, "%Y-%m-%d") if internship_start_str else datetime.today()
+        internship_end = datetime.strptime(internship_end_str, "%Y-%m-%d") if internship_end_str else internship_start + timedelta(days=90)  # default 3 months
+    except ValueError:
+        return jsonify({"error": "Invalid date format. Use YYYY-MM-DD"}), 400
+
+    # Create a new InternshipProcess record
+    new_internship = InternshipProcess1(
+        candidate_id=candidate.candidate_id,
+        review_status="pending",  # default status
+        internship_start=internship_start,
+        internship_end=internship_end
+    )
+
+    # Save to DB
+    db.session.add(new_internship)
+    db.session.commit()
+
+    return jsonify({
+        "message": "Internship created successfully",
+        "candidate_id": candidate.candidate_id,
+        "internship_start": internship_start.strftime("%Y-%m-%d"),
+        "internship_end": internship_end.strftime("%Y-%m-%d")
+    })
+
+@app.route("/templates/upload", methods=["POST"])
+def upload_template():
+    company = request.form.get("company_name")
+    template = request.files.get("file")
+
+    if not template or not company:
+        return jsonify({"error": "Missing required fields"}), 400
+
+    save_path = f"templates/{company}_{template.filename}"
+    template.save(save_path)
+
+    new = DocumentTemplate(
+        template_name=template.filename,
+        company_name=company,
+        file_path=save_path
+    )
+    db.session.add(new)
+    db.session.commit()
+
+    return jsonify({"message": "Template uploaded successfully", "template_id": new.id})
+
+@app.route("/check-internships", methods=["GET"])
+def check_internships():
+    all_internships = InternshipProcess1.query.all()  # get everything
+
+    result = [
+        {
+            "candidate_id": i.candidate_id,
+            "process_id": i.id,
+            "review_status": i.review_status,
+            "internship_start": i.internship_start.strftime("%Y-%m-%d") if i.internship_start else None,
+            "internship_end": i.internship_end.strftime("%Y-%m-%d") if i.internship_end else None
+        }
+        for i in all_internships
+    ]
+
+    return jsonify(result)
+
+@app.route("/certificate/approve", methods=["POST"])
+def approve_certificate():
+    data = request.json
+    process_id = data.get("process_id")
+    decision = data.get("decision")  # approved / rejected
+
+    process = InternshipProcess.query.get(process_id)
+    if not process:
+        return jsonify({"error": "Invalid process"}), 404
+
+    process.review_status = decision
+    db.session.commit()
+
+    if decision == "approved":
+        return jsonify({
+            "message": "Approved — generating certificate",
+            "trigger_generate": True,
+            "process_id": process.id
+        })
+
+    return jsonify({"message": "Rejected — no certificate"})
+
+@app.route("/certificate/generate", methods=["POST"])
+def generate_certificate():
+    data = request.json
+    process_ids = data.get("process_ids")
+    template_id = data.get("template_id")
+
+    template = DocumentTemplate.query.get(template_id)
+    if not template:
+        return jsonify({"error": "Invalid template"}), 400
+
+    output_files = []
+
+    for pid in process_ids:
+        process = InternshipProcess1.query.get(pid)
+        if not process:
+            continue  # Skip invalid ID
+        
+        candidate = Candidate.query.get(process.candidate_id)
+        doc = DocxTemplate(template.file_path)
+
+        context = {
+            "name": candidate.name,
+            "email": candidate.email,
+            "company": candidate.company_name,
+            "role": candidate.job_role,
+            "date": datetime.today().strftime("%d-%m-%Y")
+        }
+        doc.render(context)
+
+        os.makedirs("generated_docs", exist_ok=True)
+        output_path = f"generated_docs/{candidate.name}_certificate.docx"
+        doc.save(output_path)
+
+        process.approved_doc = output_path
+        db.session.commit()
+
+        output_files.append(output_path)
+
+    return jsonify({
+        "message": "Certificates generated successfully",
+        "files": output_files
+    })
+
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
